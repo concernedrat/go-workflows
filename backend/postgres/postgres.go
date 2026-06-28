@@ -23,7 +23,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
-	_ "github.com/lib/pq"               // pq driver for LISTEN/NOTIFY support
+	_ "github.com/lib/pq"              // pq driver for LISTEN/NOTIFY support
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -64,9 +64,16 @@ func NewPostgresBackend(host string, port int, user, password, database string, 
 		}
 	}
 
-	// Initialize notification listener if enabled
+	// Initialize notification listener if enabled. LISTEN needs a session-
+	// level connection, so a dedicated DSN (WithListenerDSN) takes precedence
+	// over the regular one - required when SQL goes through a transaction-
+	// pooling proxy like PgBouncer, which does not support LISTEN.
 	if options.EnableNotifications {
-		b.listener = newNotificationListener(dsn, options.Logger)
+		listenerDSN := options.ListenerDSN
+		if listenerDSN == "" {
+			listenerDSN = dsn
+		}
+		b.listener = newNotificationListener(listenerDSN, options.Logger)
 	}
 
 	return b
@@ -522,9 +529,25 @@ func (pb *postgresBackend) GetWorkflowTask(ctx context.Context, queues []workflo
 			return task, err
 		}
 
+		// Triggers only fire on INSERT. An event scheduled with a future
+		// visible_at (workflow timers, retry backoff) becomes due WITHOUT any
+		// new notification, so bound the wait by the next visibility instant.
+		waitCtx := ctx
+		if next, nerr := pb.nextVisibleAt(ctx, "pending_events"); nerr == nil && next != nil {
+			var cancel context.CancelFunc
+			waitCtx, cancel = context.WithDeadline(ctx, *next)
+			defer cancel()
+		}
+
 		// No task available, wait for notification
-		if pb.listener.WaitForWorkflowTask(ctx) {
+		if pb.listener.WaitForWorkflowTask(waitCtx) {
 			// Got notification, try again
+			return pb.getWorkflowTaskImpl(ctx, queues)
+		}
+
+		if ctx.Err() == nil {
+			// Our visibility deadline expired (not the caller's context):
+			// a timer just became due - check again.
 			return pb.getWorkflowTaskImpl(ctx, queues)
 		}
 
@@ -534,6 +557,24 @@ func (pb *postgresBackend) GetWorkflowTask(ctx context.Context, queues []workflo
 
 	// Notifications disabled, use standard polling
 	return pb.getWorkflowTaskImpl(ctx, queues)
+}
+
+// nextVisibleAt returns the earliest future visible_at in the given task
+// table (pending_events or activities), or nil when nothing is scheduled.
+// Used to bound notification waits so time-deferred work is picked up on
+// schedule even though no INSERT (and therefore no NOTIFY) happens when it
+// becomes visible.
+func (pb *postgresBackend) nextVisibleAt(ctx context.Context, table string) (*time.Time, error) {
+	var t sql.NullTime
+	if err := pb.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT MIN(visible_at) FROM %s WHERE visible_at IS NOT NULL AND visible_at > now()`, table),
+	).Scan(&t); err != nil {
+		return nil, err
+	}
+	if !t.Valid {
+		return nil, nil
+	}
+	return &t.Time, nil
 }
 
 func (pb *postgresBackend) getWorkflowTaskImpl(ctx context.Context, queues []workflow.Queue) (*backend.WorkflowTask, error) {
@@ -902,9 +943,22 @@ func (pb *postgresBackend) GetActivityTask(ctx context.Context, queues []workflo
 			return task, err
 		}
 
+		// Bound the wait by the next future visible_at (see GetWorkflowTask).
+		waitCtx := ctx
+		if next, nerr := pb.nextVisibleAt(ctx, "activities"); nerr == nil && next != nil {
+			var cancel context.CancelFunc
+			waitCtx, cancel = context.WithDeadline(ctx, *next)
+			defer cancel()
+		}
+
 		// No task available, wait for notification
-		if pb.listener.WaitForActivityTask(ctx) {
+		if pb.listener.WaitForActivityTask(waitCtx) {
 			// Got notification, try again
+			return pb.getActivityTaskImpl(ctx, queues)
+		}
+
+		if ctx.Err() == nil {
+			// Visibility deadline expired - deferred work is now due.
 			return pb.getActivityTaskImpl(ctx, queues)
 		}
 

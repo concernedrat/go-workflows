@@ -22,13 +22,14 @@ const (
 	listenerPingInterval = 90 * time.Second
 )
 
-// notificationListener manages LISTEN/NOTIFY connections for reactive task polling
+// notificationListener manages a single LISTEN/NOTIFY connection for reactive
+// task polling. Both channels are multiplexed over one session so a process
+// holds exactly one listener connection to Postgres.
 type notificationListener struct {
 	dsn    string
 	logger *slog.Logger
 
-	workflowListener *pq.Listener
-	activityListener *pq.Listener
+	listener *pq.Listener
 
 	workflowNotify chan struct{}
 	activityNotify chan struct{}
@@ -59,43 +60,34 @@ func (nl *notificationListener) Start(ctx context.Context) error {
 		return nil
 	}
 
-	// Create a cancellable context for the handler goroutines
+	// Create a cancellable context for the handler goroutine
 	nl.ctx, nl.cancel = context.WithCancel(context.Background())
 
-	// Create listener for workflow tasks
-	nl.workflowListener = pq.NewListener(nl.dsn, listenerMinReconnectInterval, listenerMaxReconnectInterval, func(ev pq.ListenerEventType, err error) {
+	nl.listener = pq.NewListener(nl.dsn, listenerMinReconnectInterval, listenerMaxReconnectInterval, func(ev pq.ListenerEventType, err error) {
 		if err != nil {
-			nl.logger.Error("workflow listener event", "event", ev, "error", err)
+			nl.logger.Error("notification listener event", "event", ev, "error", err)
 		}
 	})
 
-	if err := nl.workflowListener.Listen(workflowTasksChannel); err != nil {
+	if err := nl.listener.Listen(workflowTasksChannel); err != nil {
+		nl.listener.Close()
 		return fmt.Errorf("listening to workflow tasks channel: %w", err)
 	}
 
-	// Create listener for activity tasks
-	nl.activityListener = pq.NewListener(nl.dsn, listenerMinReconnectInterval, listenerMaxReconnectInterval, func(ev pq.ListenerEventType, err error) {
-		if err != nil {
-			nl.logger.Error("activity listener event", "event", ev, "error", err)
-		}
-	})
-
-	if err := nl.activityListener.Listen(activityTasksChannel); err != nil {
-		nl.workflowListener.Close()
+	if err := nl.listener.Listen(activityTasksChannel); err != nil {
+		nl.listener.Close()
 		return fmt.Errorf("listening to activity tasks channel: %w", err)
 	}
 
 	nl.started = true
 
-	// Start goroutines to handle notifications
-	nl.wg.Add(2)
-	go nl.handleWorkflowNotifications()
-	go nl.handleActivityNotifications()
+	nl.wg.Add(1)
+	go nl.handleNotifications()
 
 	return nil
 }
 
-// Close stops the listeners
+// Close stops the listener
 func (nl *notificationListener) Close() error {
 	nl.mu.Lock()
 	if nl.closed {
@@ -104,96 +96,76 @@ func (nl *notificationListener) Close() error {
 	}
 	nl.closed = true
 
-	// Cancel the context to stop handler goroutines
+	// Cancel the context to stop the handler goroutine
 	if nl.cancel != nil {
 		nl.cancel()
 	}
 	nl.mu.Unlock()
 
-	// Wait for handler goroutines to finish
+	// Wait for the handler goroutine to finish
 	nl.wg.Wait()
 
-	// Now safe to close listeners and channels
-	var errs []error
-	if nl.workflowListener != nil {
-		if err := nl.workflowListener.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing workflow listener: %w", err))
-		}
-	}
-
-	if nl.activityListener != nil {
-		if err := nl.activityListener.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("closing activity listener: %w", err))
+	// Now safe to close the listener and channels
+	var err error
+	if nl.listener != nil {
+		if cerr := nl.listener.Close(); cerr != nil {
+			err = fmt.Errorf("closing notification listener: %w", cerr)
 		}
 	}
 
 	close(nl.workflowNotify)
 	close(nl.activityNotify)
 
-	if len(errs) > 0 {
-		return fmt.Errorf("errors closing listeners: %v", errs)
-	}
-
-	return nil
+	return err
 }
 
-func (nl *notificationListener) handleWorkflowNotifications() {
+// handleNotifications dispatches incoming notifications to the per-kind
+// wake channels. Sends are non-blocking: the channels have capacity 1 and
+// coalesce bursts - a pending wake-up already covers any number of tasks
+// because the consumer re-queries until empty.
+func (nl *notificationListener) handleNotifications() {
 	defer nl.wg.Done()
 
 	for {
 		select {
 		case <-nl.ctx.Done():
 			return
-		case notification, ok := <-nl.workflowListener.Notify:
+		case notification, ok := <-nl.listener.Notify:
 			if !ok {
 				return
 			}
-			if notification != nil {
-				// Non-blocking send to notify channel
-				select {
-				case nl.workflowNotify <- struct{}{}:
-				default:
-					// Channel already has a pending notification
-				}
+			if notification == nil {
+				// pq sends nil after a connection loss + re-establish:
+				// notifications may have been missed while disconnected.
+				// Conservatively wake both consumers so they re-check.
+				nl.nudge(nl.workflowNotify)
+				nl.nudge(nl.activityNotify)
+				continue
+			}
+			switch notification.Channel {
+			case workflowTasksChannel:
+				nl.nudge(nl.workflowNotify)
+			case activityTasksChannel:
+				nl.nudge(nl.activityNotify)
 			}
 		case <-time.After(listenerPingInterval):
 			// Periodic ping to keep connection alive
-			if err := nl.workflowListener.Ping(); err != nil {
-				nl.logger.Error("workflow listener ping failed", "error", err)
+			if err := nl.listener.Ping(); err != nil {
+				nl.logger.Error("notification listener ping failed", "error", err)
 			}
 		}
 	}
 }
 
-func (nl *notificationListener) handleActivityNotifications() {
-	defer nl.wg.Done()
-
-	for {
-		select {
-		case <-nl.ctx.Done():
-			return
-		case notification, ok := <-nl.activityListener.Notify:
-			if !ok {
-				return
-			}
-			if notification != nil {
-				// Non-blocking send to notify channel
-				select {
-				case nl.activityNotify <- struct{}{}:
-				default:
-					// Channel already has a pending notification
-				}
-			}
-		case <-time.After(listenerPingInterval):
-			// Periodic ping to keep connection alive
-			if err := nl.activityListener.Ping(); err != nil {
-				nl.logger.Error("activity listener ping failed", "error", err)
-			}
-		}
+func (nl *notificationListener) nudge(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+		// Channel already has a pending notification
 	}
 }
 
-// WaitForWorkflowTask waits for a workflow task notification or timeout
+// WaitForWorkflowTask waits for a workflow task notification or context end.
 func (nl *notificationListener) WaitForWorkflowTask(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -203,7 +175,7 @@ func (nl *notificationListener) WaitForWorkflowTask(ctx context.Context) bool {
 	}
 }
 
-// WaitForActivityTask waits for an activity task notification or timeout
+// WaitForActivityTask waits for an activity task notification or context end.
 func (nl *notificationListener) WaitForActivityTask(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
