@@ -52,10 +52,11 @@ func NewPostgresBackend(host string, port int, user, password, database string, 
 	}
 
 	b := &postgresBackend{
-		dsn:        dsn,
-		db:         db,
-		workerName: getWorkerName(options),
-		options:    options,
+		dsn:            dsn,
+		db:             db,
+		workerName:     getWorkerName(options),
+		options:        options,
+		ownsConnection: true,
 	}
 
 	if options.ApplyMigrations {
@@ -79,12 +80,55 @@ func NewPostgresBackend(host string, port int, user, password, database string, 
 	return b
 }
 
+// NewPostgresBackendWithDB creates a new Postgres backend using an existing database connection.
+//
+// LISTEN requires a session-level connection, so notifications are only wired up when a
+// dedicated listener DSN (WithListenerDSN) is supplied; the shared *sql.DB is not used for LISTEN.
+// When using this constructor, the backend will not close the database connection when Close() is called.
+// Migrations can still be applied using WithApplyMigrations(true) as Postgres does not require
+// special connection settings for migrations.
+func NewPostgresBackendWithDB(db *sql.DB, opts ...option) *postgresBackend {
+	options := &options{
+		Options:         backend.ApplyOptions(),
+		ApplyMigrations: false,
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	b := &postgresBackend{
+		dsn:            "",
+		db:             db,
+		workerName:     getWorkerName(options),
+		options:        options,
+		ownsConnection: false,
+	}
+
+	if options.ApplyMigrations {
+		if err := b.Migrate(); err != nil {
+			panic(err)
+		}
+	}
+
+	// Initialize notification listener if enabled. This constructor has no
+	// regular DSN to fall back to, so a dedicated listener DSN (WithListenerDSN)
+	// is required - LISTEN needs its own session-level connection and cannot
+	// use the shared pool.
+	if options.EnableNotifications && options.ListenerDSN != "" {
+		b.listener = newNotificationListener(options.ListenerDSN, options.Logger)
+	}
+
+	return b
+}
+
 type postgresBackend struct {
-	dsn        string
-	db         *sql.DB
-	workerName string
-	options    *options
-	listener   *notificationListener
+	dsn            string
+	db             *sql.DB
+	workerName     string
+	options        *options
+	ownsConnection bool
+	listener       *notificationListener
 }
 
 func (pb *postgresBackend) FeatureSupported(feature backend.Feature) bool {
@@ -98,15 +142,27 @@ func (pb *postgresBackend) Close() error {
 			pb.options.Logger.Error("closing notification listener", "error", err)
 		}
 	}
+	if !pb.ownsConnection {
+		return nil
+	}
 	return pb.db.Close()
 }
 
 // Migrate applies any pending database migrations.
 func (pb *postgresBackend) Migrate() error {
-	schemaDsn := pb.dsn
-	db, err := sql.Open("pgx", schemaDsn)
-	if err != nil {
-		return fmt.Errorf("opening schema database: %w", err)
+	var db *sql.DB
+	var needsClose bool
+
+	if pb.dsn != "" {
+		var err error
+		db, err = sql.Open("pgx", pb.dsn)
+		if err != nil {
+			return fmt.Errorf("opening schema database: %w", err)
+		}
+		needsClose = true
+	} else {
+		db = pb.db
+		needsClose = false
 	}
 
 	dbi, err := postgres.WithInstance(db, &postgres.Config{})
@@ -130,8 +186,10 @@ func (pb *postgresBackend) Migrate() error {
 		}
 	}
 
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("closing schema database: %w", err)
+	if needsClose {
+		if err := db.Close(); err != nil {
+			return fmt.Errorf("closing schema database: %w", err)
+		}
 	}
 
 	return nil
