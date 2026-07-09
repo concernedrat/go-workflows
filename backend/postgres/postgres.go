@@ -590,12 +590,18 @@ func (pb *postgresBackend) GetWorkflowTask(ctx context.Context, queues []workflo
 		// Triggers only fire on INSERT. An event scheduled with a future
 		// visible_at (workflow timers, retry backoff) becomes due WITHOUT any
 		// new notification, so bound the wait by the next visibility instant.
-		waitCtx := ctx
-		if next, nerr := pb.nextVisibleAt(ctx, "pending_events"); nerr == nil && next != nil {
-			var cancel context.CancelFunc
-			waitCtx, cancel = context.WithDeadline(ctx, *next)
-			defer cancel()
+		// Always bound the wait with a safety re-poll: a NOTIFY can be lost
+		// (listener session not yet established at process start, transient
+		// reconnect), and an unbounded wait would strand already-pending
+		// work until an unrelated notification happens to arrive. The cap
+		// turns a lost wake-up into a <=safetyPollInterval delay while
+		// keeping idle load at one cheap query per interval.
+		deadline := time.Now().Add(safetyPollInterval)
+		if next, nerr := pb.nextVisibleAt(ctx, "pending_events"); nerr == nil && next != nil && next.Before(deadline) {
+			deadline = *next
 		}
+		waitCtx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
 
 		// No task available, wait for notification
 		if pb.listener.WaitForWorkflowTask(waitCtx) {
@@ -616,6 +622,14 @@ func (pb *postgresBackend) GetWorkflowTask(ctx context.Context, queues []workflo
 	// Notifications disabled, use standard polling
 	return pb.getWorkflowTaskImpl(ctx, queues)
 }
+
+// safetyPollInterval caps every notification wait. NOTIFY delivery is
+// best-effort from the poller's perspective (session may not be up yet at
+// process start, or may be mid-reconnect), so pollers re-check the queue at
+// least this often even when nothing is scheduled. Keeps the engine's
+// worst-case latency for a lost notification at one interval while staying
+// far below the cost of tight polling.
+const safetyPollInterval = 60 * time.Second
 
 // nextVisibleAt returns the earliest future visible_at in the given task
 // table (pending_events or activities), or nil when nothing is scheduled.
@@ -1002,12 +1016,13 @@ func (pb *postgresBackend) GetActivityTask(ctx context.Context, queues []workflo
 		}
 
 		// Bound the wait by the next future visible_at (see GetWorkflowTask).
-		waitCtx := ctx
-		if next, nerr := pb.nextVisibleAt(ctx, "activities"); nerr == nil && next != nil {
-			var cancel context.CancelFunc
-			waitCtx, cancel = context.WithDeadline(ctx, *next)
-			defer cancel()
+		// Safety-capped wait - see GetWorkflowTask for rationale.
+		deadline := time.Now().Add(safetyPollInterval)
+		if next, nerr := pb.nextVisibleAt(ctx, "activities"); nerr == nil && next != nil && next.Before(deadline) {
+			deadline = *next
 		}
+		waitCtx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
 
 		// No task available, wait for notification
 		if pb.listener.WaitForActivityTask(waitCtx) {
